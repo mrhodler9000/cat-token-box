@@ -35,6 +35,79 @@ export class TokenService {
     @InjectRepository(TxEntity)
     private readonly txRepository: Repository<TxEntity>,
   ) {}
+  
+  async listAllTokens(offset: number = 0, limit: number = 10) {
+    let sql = `
+      WITH token_supply AS (
+        SELECT 
+          token_pubkey,
+          COALESCE(SUM(token_amount), 0) AS supply
+        FROM token_mint
+        GROUP BY token_pubkey
+      ),
+      token_holders AS (
+        SELECT 
+          xonly_pubkey,
+          COUNT(DISTINCT owner_pkh) AS holders
+        FROM tx_out
+        WHERE spend_txid IS NULL
+        GROUP BY xonly_pubkey
+      )
+      SELECT
+        token.decimals AS "decimals",
+        token.genesis_txid AS "genesisTxid",
+        token.raw_info AS "info",
+        token.minter_pubkey AS "minterPubKey",
+        token.name AS "name",
+        token.symbol AS "symbol",
+        token.reveal_txid AS "revealTxid",
+        token.reveal_height AS "revealHeight",
+        token.token_pubkey AS "tokenPubKey",
+        token.token_id AS "tokenId",
+        COALESCE(ts.supply, 0) AS "supply",
+        COALESCE(th.holders, 0) AS "holders"
+      FROM
+        token_info token
+      LEFT JOIN token_supply ts ON ts.token_pubkey = token.token_pubkey
+      LEFT JOIN token_holders th ON th.xonly_pubkey = token.token_pubkey
+      LIMIT $1 OFFSET $2
+    `;
+
+    // Optimize the query by using subqueries with indexes
+    const tokens = await this.tokenInfoRepository.query(sql, [
+      limit || Constants.QUERY_PAGING_DEFAULT_LIMIT,
+      offset || Constants.QUERY_PAGING_DEFAULT_OFFSET,
+    ]);
+
+    return tokens.map((token) => ({
+      ...this.renderTokenInfo(token),
+      supply: parseInt(token.supply, 10),
+      holders: parseInt(token.holders, 10),
+    }));
+  }
+
+  async countAllTokens() {
+    return await this.tokenInfoRepository.count();
+  }
+
+  async getTokenSupply(tokenIdOrTokenAddr: string): Promise<number | null> {
+    const tokenInfo =
+      await this.getTokenInfoByTokenIdOrTokenAddress(tokenIdOrTokenAddr);
+    if (!tokenInfo) {
+      return null;
+    }
+
+    const result = await this.tokenInfoRepository.query(
+      `
+      SELECT COALESCE(SUM(token_amount), 0) as total_supply
+      FROM token_mint
+      WHERE token_pubkey = $1
+    `,
+      [tokenInfo.tokenPubKey],
+    );
+
+    return parseInt(result[0]?.total_supply || '0', 10);
+  }
 
   async getTokenInfoByTokenIdOrTokenAddress(tokenIdOrTokenAddr: string) {
     let cached = TokenService.tokenInfoCache.get(tokenIdOrTokenAddr);
@@ -83,6 +156,72 @@ export class TokenService {
     delete rendered.createdAt;
     delete rendered.updatedAt;
     return rendered;
+  }
+  
+  async getTokenInfoByTokenIdOrTokenAddressDisplay(tokenIdOrTokenAddr: string) {
+    let where;
+    if (tokenIdOrTokenAddr.includes('_')) {
+      where = { tokenId: tokenIdOrTokenAddr };
+    } else {
+      const tokenPubKey = addressToXOnlyPubKey(tokenIdOrTokenAddr);
+      if (!tokenPubKey) {
+        return null;
+      }
+      where = { tokenPubKey };
+    }
+
+    const tokenInfo = await this.tokenInfoRepository.findOne({
+      where,
+    });
+
+    if (!tokenInfo) {
+      return null;
+    }
+
+    const result = await this.tokenInfoRepository.query(
+      `
+      WITH token_supply AS (
+        SELECT 
+          token_pubkey,
+          COALESCE(SUM(token_amount), 0) AS supply
+        FROM token_mint
+        WHERE token_pubkey = $1
+        GROUP BY token_pubkey
+      ),
+      token_holders AS (
+        SELECT 
+          xonly_pubkey,
+          COUNT(DISTINCT owner_pkh) AS holders
+        FROM tx_out
+        WHERE spend_txid IS NULL AND xonly_pubkey = $1
+        GROUP BY xonly_pubkey
+      )
+      SELECT
+        token.decimals AS "decimals",
+        token.genesis_txid AS "genesisTxid",
+        token.raw_info AS "info",
+        token.minter_pubkey AS "minterPubKey",
+        token.name AS "name",
+        token.symbol AS "symbol",
+        token.reveal_txid AS "revealTxid",
+        token.reveal_height AS "revealHeight",
+        token.token_pubkey AS "tokenPubKey",
+        token.token_id AS "tokenId",
+        COALESCE(ts.supply, 0) AS "supply",
+        COALESCE(th.holders, 0) AS "holders"
+      FROM
+        token_info token
+      LEFT JOIN token_supply ts ON ts.token_pubkey = token.token_pubkey
+      LEFT JOIN token_holders th ON th.xonly_pubkey = token.token_pubkey
+      WHERE token.token_pubkey = $1 OR token.token_id = $2
+      `,
+      [tokenInfo.tokenPubKey, tokenInfo.tokenId],
+    );
+    return {
+      ...this.renderTokenInfo(result[0]),
+      supply: parseInt(result[0].supply, 10),
+      holders: parseInt(result[0].holders, 10),
+    };
   }
 
   async getTokenUtxosByOwnerAddress(
@@ -228,5 +367,48 @@ export class TokenService {
         (balances[utxo.xOnlyPubKey] || 0n) + BigInt(utxo.tokenAmount);
     }
     return balances;
+  }
+
+  async getTokenTxHistoryByOwnerAddress(
+    tokenIdOrTokenAddr: string,
+    ownerAddr: string,
+    offset: number,
+    limit: number,
+  ) {
+    const lastProcessedHeight =
+      await this.commonService.getLastProcessedBlockHeight();
+    const tokenInfo =
+      await this.getTokenInfoByTokenIdOrTokenAddress(tokenIdOrTokenAddr);
+    const ownerPubKeyHash = ownerAddressToPubKeyHash(ownerAddr);
+    if (
+      lastProcessedHeight === null ||
+      !tokenInfo ||
+      !tokenInfo.tokenPubKey ||
+      !ownerPubKeyHash
+    ) {
+      return { history: [], blockHeight: lastProcessedHeight };
+    }
+    const sql = `select distinct tx.txid, tx.block_height
+      from tx_out
+              left join tx on tx_out.txid = tx.txid or tx_out.spend_txid = tx.txid
+      where tx_out.owner_pkh = $1
+        and tx_out.xonly_pubkey = $2
+        and tx.block_height <= $3
+      order by tx.block_height desc
+      limit $4 offset $5;`;
+    const history = await this.txOutRepository.query(sql, [
+      ownerPubKeyHash,
+      tokenInfo.tokenPubKey,
+      lastProcessedHeight,
+      Math.min(
+        limit || Constants.QUERY_PAGING_DEFAULT_LIMIT,
+        Constants.QUERY_PAGING_MAX_LIMIT,
+      ),
+      offset || Constants.QUERY_PAGING_DEFAULT_OFFSET,
+    ]);
+    return {
+      history: history.map((e) => e.txid),
+      trackerBlockHeight: lastProcessedHeight,
+    };
   }
 }

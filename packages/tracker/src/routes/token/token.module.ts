@@ -6,6 +6,7 @@ import { TokenInfoEntity } from '../../entities/tokenInfo.entity';
 import { TxOutEntity } from '../../entities/txOut.entity';
 import { TxEntity } from '../../entities/tx.entity';
 import { CommonModule } from '../../services/common/common.module';
+import { BlockModule } from '../../services/block/block.module';
 
 @Module({
   imports: [
